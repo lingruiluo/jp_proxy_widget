@@ -153,8 +153,8 @@ class JSProxyWidget(widgets.DOMWidget):
     _model_name = Unicode('JSProxyModel').tag(sync=True)
     _view_module = Unicode('jp_proxy_widget').tag(sync=True)
     _model_module = Unicode('jp_proxy_widget').tag(sync=True)
-    _view_module_version = Unicode('^1.0.3').tag(sync=True)
-    _model_module_version = Unicode('^1.0.3').tag(sync=True)
+    _view_module_version = Unicode('^1.0.6').tag(sync=True)
+    _model_module_version = Unicode('^1.0.6').tag(sync=True)
 
     # traitlet port to use for sending commands to javascript
     #commands = traitlets.List([], sync=True)
@@ -182,6 +182,7 @@ class JSProxyWidget(widgets.DOMWidget):
         self.count_to_results_callback = {}
         self.default_event_callback = None
         self.identifier_to_callback = {}
+        self.callable_cache = {}
         #self.callback_to_identifier = {}
         #self.on_trait_change(self.handle_callback_results, "callback_results")
         #self.on_trait_change(self.handle_results, "results")
@@ -190,7 +191,7 @@ class JSProxyWidget(widgets.DOMWidget):
         ##pr "registered on_msg(handle_custom_message)"
         self.on_msg(self.handle_custom_message_wrapper)
         self.buffered_commands = []
-        self.commands_awaiting_render = []
+        #self.commands_awaiting_render = []
         self.last_commands_sent = []
         self.last_callback_results = None
         self.results = []
@@ -205,31 +206,6 @@ class JSProxyWidget(widgets.DOMWidget):
             element.window = window;
             element._FRAGILE_THIS = null;
         """)
-
-    def execute_and_return_fragile_reference(self, for_action):
-        "This is a trick to support D3-style chaining of Python expressions that map to Javascript."
-        #if self.executing_fragile:
-        #    raise ValueError("recursing in fragile execution")
-        #self.executing_fragile = True
-        #("execute_and_return_fragile_reference(")
-        # execute the action and cache the result temporarily
-        #self.element._set(FRAGILE_JS_REFERENCE, for_action)
-        # DON'T execute it twice
-        #self(cached)
-        #reference = self.element[FRAGILE_JS_REFERENCE]
-        #self.executing_fragile = False
-        #reference = ["get", ["element"], FRAGILE_JS_REFERENCE]
-        #execute_action = ["set", ["element"], FRAGILE_JS_REFERENCE, for_action]
-        # Save action stores value used as "this" in chained method calls
-        save_action = SetMaker(
-            self.get_element(), 
-            FRAGILE_THIS,
-            MethodMaker(self.get_element(), FRAGILE_JS_REFERENCE)
-            )
-        execute_action = SetMaker(self.get_element(), FRAGILE_JS_REFERENCE, for_action)
-        self.send_commands([save_action, execute_action])
-        reference = MethodMaker(self.get_element(), FRAGILE_JS_REFERENCE)
-        return FragileReference(self, reference, for_action)
 
     def set_element(self, slot_name, value):
         """
@@ -307,6 +283,10 @@ class JSProxyWidget(widgets.DOMWidget):
 
     print_on_error = True
 
+    def setTimeout(self, callable, milliseconds):
+        "Convenience access to window.setTimeout in Javascript"
+        self.element.window.setTimeout(callable, milliseconds)
+
     def handle_error_msg(self, att_name, old, new):
         if self.print_on_error:
             print("new error message: " + new)
@@ -314,8 +294,11 @@ class JSProxyWidget(widgets.DOMWidget):
     def handle_rendered(self, att_name, old, new):
         "when rendered send any commands awaiting the render event."
         try:
-            if self.commands_awaiting_render:
-                self.send_commands([])
+            #if self.commands_awaiting_render:
+                #self.send_commands([])
+            if self.auto_flush:
+                #("xxxx flushing on render")
+                self.flush()
             self.status= "Rendered."
         except Exception as e:
             self.error_msg = repr(e)
@@ -326,10 +309,10 @@ class JSProxyWidget(widgets.DOMWidget):
             INDICATOR: indicator,
             PAYLOAD: payload,
         }
-        # XXXX debug
         self._last_payload = payload
-        #pr("sending")
-        #pprint(package)
+        if self.verbose:
+            print("sending")
+            pprint(package)
         debug_check_commands(package)
         self.send(package)
 
@@ -408,21 +391,37 @@ class JSProxyWidget(widgets.DOMWidget):
         return prefix + str(IDENTITY_COUNTER[0])
 
     def __call__(self, command):
+        "Send command convenience."
+        return self.buffer_command(command)
+
+    def buffer_command(self, command):
         "Add a command to the buffered commands. Convenience."
-        #self.buffered_commands.append(command)
-        self.send_command(command)
+        self.buffer_commands([command])
+        return command
+
+    def buffer_commands(self, commands):
+        self.buffered_commands.extend(commands)
         if self.auto_flush:
             self.flush()
-        return command
+        return commands
 
     def seg_flush(self, results_callback=None, level=1, segmented=BIG_SEGMENT):
         "flush a potentially large command sequence, segmented."
         return self.flush(results_callback, level, segmented)
 
+    error_on_flush = False  # Primarily for debugging
+
     def flush(self, results_callback=None, level=1, segmented=None):
         "send the buffered commands and clear the buffer. Convenience."
+        if not self.rendered:
+            #("XXXX not flushing before render", len(self.buffered_commands))
+            self.status = "deferring flush until render"
+            return None
+        if self.error_on_flush:
+            raise ValueError("flush is disabled")
         commands = self.buffered_commands
         self.buffered_commands = []
+        #("XXXXX now flushing", len(commands))
         result = self.send_commands(commands, results_callback, level, segmented=segmented)
         self._send_counter += 1
         return result
@@ -434,14 +433,12 @@ class JSProxyWidget(widgets.DOMWidget):
         value is a reference to the element by name.
         """
         elt = self.get_element()
-        if callable(reference):
-            # convert to javascript callback
-            reference = self.callable(reference)  # XXXX should generalize this to allow callablse of lists etc
+        reference = self.wrap_callables(reference)
         save_command = elt._set(name, reference)
         # buffer the save operation
         self(save_command)
         # return the reference by name
-        return getattr(elt, name)
+        return getattr(self.element, name)
 
     _jqueryUI_checked = False
 
@@ -640,10 +637,13 @@ class JSProxyWidget(widgets.DOMWidget):
         if check:
             debug_check_commands(commands)
         if self.rendered:
-            # also send any commands awaiting the render event.
-            if self.commands_awaiting_render:
-                commands = commands + self.commands_awaiting_render
-                self.commands_awaiting_render = None
+            # also send buffered commands
+            #if self.commands_awaiting_render:
+            #    commands = commands + self.commands_awaiting_render
+            #    self.commands_awaiting_render = None
+            if self.buffered_commands:
+                commands = self.buffered_commands + commands
+                self.buffered_commands = []
             payload = [count, commands, level]
             if results_callback is not None:
                 self.identifier_to_callback[count] = results_callback
@@ -658,7 +658,8 @@ class JSProxyWidget(widgets.DOMWidget):
         else:
             # wait for render event before sending commands.
             ##pr "waiting for render!", commands
-            self.commands_awaiting_render.extend(commands)
+            #self.commands_awaiting_render.extend(commands)
+            self.buffered_commands.extend(commands)
             return ("awaiting render", commands)
 
     def send_segmented_message(self, frag_ind, final_ind, payload, segmented):
@@ -676,6 +677,7 @@ class JSProxyWidget(widgets.DOMWidget):
         json_tail = json_str[cursor:]
         self.send_custom_message(final_ind, json_tail)
     
+    """ # doesn't work: not used.
     def evaluate(self, command, level=1, timeout=3000):
         "Send one command and wait for result.  Return result."
         results = self.evaluate_commands([command], level, timeout)
@@ -699,6 +701,7 @@ class JSProxyWidget(widgets.DOMWidget):
                 raise Exception("Timeout waiting for command results: " + repr(timeout))
             ip.kernel.do_one_iteration()
         return result_list[0]
+    """
 
     def seg_callback(self, callback_function, data, level=1, delay=False, segmented=BIG_SEGMENT):
         """
@@ -718,6 +721,11 @@ class JSProxyWidget(widgets.DOMWidget):
         # do not double wrap CallMakers
         if isinstance(function_or_method, CallMaker):
             return function_or_method
+        # get existing wrapper value from cache, if available
+        cache = self.callable_cache
+        result = cache.get(function_or_method)
+        if result is not None:
+            return result
         data = repr(function_or_method)
         def callback_function(_data, arguments):
             count = 0
@@ -731,9 +739,10 @@ class JSProxyWidget(widgets.DOMWidget):
                     count += 1
                 else:
                     break
-            #p("XXXXX callback args", py_arguments)
             function_or_method(*py_arguments)
-        return self.callback(callback_function, data, level, delay, segmented)
+        result = self.callback(callback_function, data, level, delay, segmented)
+        cache[function_or_method] = result
+        return result
 
     def callback(self, callback_function, data, level=1, delay=False, segmented=None):
         "Create a 'proxy callback' to receive events detected by the JS View."
@@ -786,9 +795,6 @@ class JSProxyWidget(widgets.DOMWidget):
         return CommandMaker("window")
 
     def load_js_files(self, filenames, force=True, local=True):
-        #  xxxx  Use that.$$el.test_js_loaded to only load the module if needed when force is False
-        #import js_context
-        #js_context.load_if_not_loaded(self, filenames, verbose=verbose, delay=delay, force=force, local=local)
         for filepath in filenames:
             def load_the_file(filepath=filepath):
                 # pr ("loading " + filepath)
@@ -820,9 +826,7 @@ class JSProxyWidget(widgets.DOMWidget):
     def validate_command(self, command, top=True):
         # convert CommandMaker to list format.
         if isinstance(command, CommandMakerSuperClass):
-            #p("XXXXX CONVERTING COMMAND MAKER", type(command), command)
             command = command._cmd()
-            #p("XXXXX CONVERTed COMMAND MAKER", type(command), command)
         elif callable(command):
             # otherwise convert callables to callbacks, in list format
             command = self.callable(command)._cmd()
@@ -841,7 +845,6 @@ class JSProxyWidget(widgets.DOMWidget):
                 assert type(name) is str, "method name must be a string " + repr(name)
                 args = self.validate_commands(args, top=False)
                 remainder = [target, name] + args
-                #p("XXXX validated method remainder", remainder)
             elif indicator == "function":
                 target = remainder[0]
                 args = remainder[1:]
@@ -888,6 +891,18 @@ class JSProxyWidget(widgets.DOMWidget):
         # Non-lists are untranslated (but should be JSON compatible).
         return command
 
+    def delay_flush(self):
+        """
+        Context manager to group a large number of operations into one message.
+        This can prevent flooding messages over the ZMQ communications link between
+        the Javascript front end and the Python kernel backend.
+
+        >>> with widget.delay_flush():
+        ...    many_operations(widget)
+        ...    even_more_operations(widget)
+        """
+        return DisableFlushContextManager(self)
+
 def indent_string(s, level, indent="    "):
     lindent = indent * level
     return s.replace("\n", "\n" + lindent)
@@ -916,6 +931,30 @@ def to_javascript(thing, level=0, indent=None, comma=","):
     return result
 
 
+# Adapted from jp_doodle.dual_canvas.DisableRedrawContextManager
+
+class DisableFlushContextManager(object):
+    """
+    Temporarily disable flushes and also collect widget messages into a single group.
+    This can speed up widget interactions and prevent the communication channel from flooding.
+    """
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.save_flush = canvas.auto_flush
+
+    def __enter__(self):
+        canvas = self.canvas
+        self.save_flush = canvas.auto_flush
+        canvas.auto_flush = False
+
+    def __exit__(self, type, value, traceback):
+        canvas = self.canvas
+        canvas.auto_flush = self.save_flush
+        if (self.save_flush):
+            canvas.flush()
+
+
 class ElementWrapper(object):
 
     """
@@ -933,7 +972,10 @@ class ElementWrapper(object):
         self.widget_element = for_widget.get_element()
 
     def __getattr__(self, name):
-        return ElementCallWrapper(self.widget, self.widget_element, name)
+        #return ElementCallWrapper(self.widget, self.widget_element, name)
+        if name == '_ipython_canary_method_should_not_exist_':
+            return 42  # ipython poking around...
+        return LazyGet(self.widget, self.widget_element, name)
 
     # for parallelism to _set
     _get = __getattr__
@@ -943,75 +985,13 @@ class ElementWrapper(object):
 
     def _set(self, name, value):
         "Proxy to set a property of the widget element."
-        return self.widget(self.widget_element._set(name, value))
-
-class ElementCallWrapper(object):
-    """
-    Wrapper for widget.element.slot_name
-    """
-
-    callable_level = 2   # ???
-
-    def __init__(self, for_widget, for_element, slot_name):
-        assert isinstance(for_widget, JSProxyWidget)
-        self.widget = for_widget
-        self.element = for_element
-        self.slot_name = slot_name
-
-    def set_context(self):
-        widget = self.widget
-        self.widget.last_attribute = name
-        setthis = SetMaker(widget.get_element(), FRAGILE_THIS, widget.get_element())
-        setref = SetMaker(
-            widget.get_element(),
-            FRAGILE_JS_REFERENCE,
-            MethodMaker(widget.get_element(), name)
-        )
-        widget.send_commands([setthis, setref])
-    
-    #def map_value(self, v):
-    #    widget = self.widget
-    #    if (not isinstance(v, CommandMakerSuperClass)) and callable(v):
-    #        #p("XXXX mapping", type(v), v)
-    #        return widget.callable(v, level=self.callable_level)
-    #    return v
-
-    def __call__(self, *args):
-        # ("elementcallwrapper.__call__")
-        #mapped_args = map(self.map_value, args)
-        widget = self.widget
-        mapped_args = self.widget.wrap_callables(args)
-        #widget(slot(*mapped_args))
-        args = widget.wrap_callables(args)
-        call = CallMaker("method", widget.get_element(), self.slot_name, *args)
-        #p("reset in elementcallwrapper call")
-        widget.last_attribute = None
-        setref = SetMaker(widget.get_element(), FRAGILE_JS_REFERENCE, call)
-        widget.send_command(setref)
-        reference = MethodMaker(widget.get_element(), FRAGILE_JS_REFERENCE)
-        return FragileReference(self.widget, reference, call)
-
-    def __getattr__(self, name):
-        assert isinstance(self.widget, JSProxyWidget)
-        if name=="wrap_callables":
-            raise SystemError(name)
-        widget = self.widget
-        #for_element = self.element[self.slot_name]
-        #get = ElementCallWrapper(self.widget, for_element, name)
-        #get = for_element[name]
-        #return widget.execute_and_return_fragile_reference(get)
-        this_ref = MethodMaker(widget.get_element(), self.slot_name)
-        attr_ref = MethodMaker(this_ref, name)
-        #p ("set in elementcallwrapper getattr", repr(name))
-        self.widget.last_attribute = name
-        set_this = SetMaker(widget.get_element(), FRAGILE_THIS, this_ref)
-        set_ref = SetMaker(widget.get_element(), FRAGILE_JS_REFERENCE, attr_ref)
-        widget.send_commands([set_this, set_ref])
-        reference = MethodMaker(widget.get_element(), FRAGILE_JS_REFERENCE)
-        return FragileReference(self.widget, reference, attr_ref)
-
-    # getattr and getitem are the same in Javascript
-    __getitem__ = __getattr__
+        #return self.widget(self.widget_element._set(name, value))
+        ref = value
+        if isinstance(value, CommandMakerSuperClass):
+            ref = value.reference()
+        command = SetMaker(self.widget_element, name, ref)
+        self.widget.buffer_commands([command])
+        return LazyGet(self.widget, self.widget_element, name)
 
 class StaleFragileJavascriptReference(ValueError):
     "Stale Javascript value reference"
@@ -1020,92 +1000,127 @@ class CommandMakerSuperClass(object):
     """
     Superclass for command proxy objects.
     """
-    pass
+    def reference(self):
+        "return cached value if available"
+        return self # default -- not cached
 
-class FragileReference(CommandMakerSuperClass):
+class LazyCommandSuperClass(CommandMakerSuperClass):
 
-    def __init__(self, for_widget, referee, cached):
-        assert not isinstance(referee, FragileReference), "bad ref to ref: " + repr(referee)
-        assert isinstance(for_widget, JSProxyWidget)
-        self.widget = for_widget
-        self.referee = referee
-        self.cached = cached
-        self.widget.last_fragile_reference = self
-        #self.widget.last_attribute = None
+    fragile_reference = "invalid"
 
     def __repr__(self):
-        return "FragileReference(%s)" % id(self.referee)
+        return repr(self._cmd())
 
-    def get_protected_content(self):
-        self.error_if_fragile_reference_is_stale()
-        return self.referee
+    def reference(self):
+        for_widget = self.for_widget
+        if for_widget.last_fragile_reference is self:
+            #return this.fragile_reference
+            return MethodMaker(for_widget.get_element(), FRAGILE_JS_REFERENCE)
+        else:
+            return self
 
-    def error_if_fragile_reference_is_stale(self):
-        #("checking fragile reference\n", repr(self.cached))
-        if self.widget.last_fragile_reference is not self:
-            raise StaleFragileJavascriptReference(
-                    "Value references should only be used in 'chained' expressions."
-                    + "  " + repr(self.cached)
-                )
+    def this_reference(self):
+        raise ValueError("this_reference only makes sense for Get")
 
-    def javascript(self, level=0):
-        content = self.get_protected_content()
-        result = content.javascript(level)
-        assert type(result) is str, repr((result, type(content), content))
-        return result
+    def javascript(self, *args):
+        raise NotImplementedError("don't convert lazy commands to javascript for now.")
+        #return repr("Javascript disabled for lazy commands: " + repr(type(self)))
 
-    def _cmd(self):
-        return self.get_protected_content()._cmd()
+    def __getattr__(self, attribute):
+        if '_ipython' in attribute:
+            return "attributes mentioning _ipython are forbidden because they cause infinite recursions: " + repr(attribute)
+        return LazyGet(self.for_widget, self, attribute)
+
+    def __getitem__(self, item):
+        return self.__getattr__(item)
 
     def __call__(self, *args):
-        #("fragilereference.__call__", args)
-        self.error_if_fragile_reference_is_stale()
-        widget = self.widget
-        #p ("args", args)
-        args = widget.wrap_callables(args)
-        #return self.referee(*args)
-        # try to call a method of fragile this
-        last_attribute = self.widget.last_attribute
-        if type(last_attribute) is str:
-            action = CallMaker(
-                "method",
-                MethodMaker(widget.get_element(), FRAGILE_THIS),
-                last_attribute,
-                *args
-            )
+        return LazyCall(self.for_widget, self, *args)
+
+    def _cmd(self):
+        raise NotImplementedError("_cmd must be defined in subclass")
+
+    def method(self, name):
+        def result(*args):
+            f = getattr(self, name)
+            return f(*args)
+        return result
+
+class LazyGet(LazyCommandSuperClass):
+
+    def __init__(self, for_widget, for_target, attribute):
+        self.for_target = for_target
+        self.for_widget = for_widget
+        self.attribute = attribute
+        # when executing immediately put target ref in fragile_this and attr value in fragile_ref
+        set_this = SetMaker(for_widget.get_element(), FRAGILE_THIS, for_target.reference())
+        # get attr value as element.fragile_this.attr
+        attr_ref = MethodMaker(MethodMaker(for_widget.get_element(), FRAGILE_THIS), attribute)
+        set_ref = SetMaker(for_widget.get_element(), FRAGILE_JS_REFERENCE, attr_ref)
+        # execute immediately on init
+        for_widget.buffer_commands([set_this, set_ref])
+        # use fragile ref to find value, until the cached value is replaced
+        for_widget.last_fragile_reference = self
+
+    def _cmd(self):
+        m = MethodMaker(self.for_target, self.attribute)
+        return m._cmd()
+
+    def __call__(self, *args):
+        if type(self.attribute) is str:
+            return LazyMethodCall(self.for_widget, self, *args)
         else:
-            # otherwise call the fragile reference as a function
-            action = CallMaker(
-                "function",
-                MethodMaker(widget.get_element(), FRAGILE_JS_REFERENCE),
-                *args
-            )
-        #p("reset in FR __call__")
-        self.widget.last_attribute = None
-        setref = SetMaker(widget.get_element(), FRAGILE_JS_REFERENCE, action)
-        widget.send_command(setref)
-        reference = MethodMaker(widget.get_element(), FRAGILE_JS_REFERENCE)
-        return FragileReference(self.widget, reference, action)
+            m = MethodMaker(self.for_target, self.attribute)
+            return LazyCall(self.for_widget, m, *args)
 
-    def __getattr__(self, name):
-        #("fragilereference.__getattr__", name)
-        if name == "_ipython_canary_method_should_not_exist_":
-            #raise AttributeError("what the ...?")
-            return 42 # this will prevent jupyter from poking around in this object (?)
-        self.error_if_fragile_reference_is_stale()
-        #p("set in FR getattr", name)
-        widget = self.widget
-        widget.last_attribute = name
-        this_ref = MethodMaker(self.widget.get_element(), FRAGILE_JS_REFERENCE)
-        attr_ref = MethodMaker(this_ref,  name)
-        set_this = SetMaker(widget.get_element(), FRAGILE_THIS, this_ref)
-        set_ref = SetMaker(widget.get_element(), FRAGILE_JS_REFERENCE, attr_ref)
-        widget.send_commands([set_this, set_ref])
-        reference = MethodMaker(widget.get_element(), FRAGILE_JS_REFERENCE)
-        return FragileReference(widget, reference, attr_ref)
+    def this_reference(self):
+        for_widget = self.for_widget
+        if for_widget.last_fragile_reference is self:
+            #return this.fragile_reference
+            return MethodMaker(for_widget.get_element(), FRAGILE_THIS)
+        else:
+            return self.for_target
 
-    # getattr and getitem are the same in Javascript
-    __getitem__ = __getattr__
+class LazyCall(LazyCommandSuperClass):
+
+    def __init__(self, for_widget, for_target, *args):
+        self.for_target = for_target
+        self.for_widget = for_widget
+        args = for_widget.wrap_callables(args)
+        self.args = args
+        # when executing immediately save result of call in fragile_ref
+        set_ref = SetMaker(
+            for_widget.get_element(),
+            FRAGILE_JS_REFERENCE,
+            CallMaker("function", self.for_target.reference(), *args)
+        )
+        for_widget.buffer_commands([set_ref])
+        for_widget.last_fragile_reference = self
+
+    def _cmd(self):
+        c = CallMaker("function", self.for_target, *self.args)
+        return c.cmd()
+        
+class LazyMethodCall(LazyCommandSuperClass):
+
+    def __init__(self, for_widget, for_method, *args):
+        self.for_method = for_method
+        self.for_widget = for_widget
+        args = for_widget.wrap_callables(args)
+        self.args = args
+        # when executing immediately save result of call in fragile_ref
+        set_ref = SetMaker(
+            for_widget.get_element(),
+            FRAGILE_JS_REFERENCE,
+            CallMaker("method", for_method.this_reference(), for_method.attribute, *args)
+        )
+        for_widget.buffer_commands([set_ref])
+        for_widget.last_fragile_reference = self
+
+    def _cmd(self):
+        for_method = self.for_method
+        m = CallMaker("method", for_method.for_target, for_method.attribute, *self.args)
+        return m._cmd()
 
 class CommandMaker(CommandMakerSuperClass):
 
@@ -1121,7 +1136,8 @@ class CommandMaker(CommandMakerSuperClass):
         self.name = name
 
     def __repr__(self):
-        return self.javascript()
+        #return self.javascript()
+        return repr(type(self)) + "::" + repr(id(self))   # disable informative reprs for now
 
     def javascript(self, level=0):
         "Return javascript text intended for this command"
@@ -1179,7 +1195,6 @@ class SetMaker(CommandMaker):
         self.target = target
         self.name = name
         self.value = value
-        ##p ("XXXX initialized setmaker: " + self.javascript())
 
     def javascript(self, level=0):
         innerlevel = 2
@@ -1334,8 +1349,6 @@ class LiteralMaker(CommandMaker):
 
 
 def quoteIfNeeded(arg):
-    #if type(arg) is FragileReference:
-    #    arg = arg.get_protected_content()
     if type(arg) in LiteralMaker.indicators:
         return LiteralMaker(arg)
     return arg

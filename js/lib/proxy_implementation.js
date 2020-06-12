@@ -26,8 +26,8 @@ var JSProxyModel = widgets.DOMWidgetModel.extend({
         _view_name : 'JSProxyView',
         _model_module : 'jp_proxy_widget',
         _view_module : 'jp_proxy_widget',
-        _model_module_version : '1.0.3',
-        _view_module_version : '1.0.3',
+        _model_module_version : '1.0.6',
+        _view_module_version : '1.0.6',
     })
 });
 
@@ -294,7 +294,9 @@ var JSProxyView = widgets.DOMWidgetView.extend({
         } else {
             results.push("no commands sent?");
         }
-        that.send_custom_message(that.RESULTS, [command_counter, results])
+        //that.send_custom_message(that.RESULTS, [command_counter, results])
+        // disable sending results for now (not used)
+        that.send_custom_message(that.RESULTS, [command_counter, true])
         return results;
     },
 
@@ -334,7 +336,9 @@ var JSProxyView = widgets.DOMWidgetView.extend({
             } else {
                 // evaluation complete: send results
                 // cl(command_counter + " execute commands done " + results.length);
-                that.send_custom_message(that.RESULTS, [command_counter, results])
+                //that.send_custom_message(that.RESULTS, [command_counter, results])
+                // disable sending results for now (not used)
+                that.send_custom_message(that.RESULTS, [command_counter, true]) 
                 return results
             }
         } catch (err) {
@@ -404,10 +408,10 @@ var JSProxyView = widgets.DOMWidgetView.extend({
                 var target_desc = remainder.shift();
                 var target = that.execute_command_result(target_desc);
                 var name = remainder.shift();
-                var args = remainder.map(that.execute_command_result, that);
                 // cl("method call " + target + "." + name);
                 var method = target[name];
                 if (method) {
+                    var args = remainder.map(that.execute_command_result, that);
                     result = method.apply(target, args);
                 } else {
                     result = "In " + target + " no such method " + name;
@@ -649,8 +653,9 @@ var JSProxyView = widgets.DOMWidgetView.extend({
             cursor = next_cursor;
             that.send_custom_message(frag_indicator, fragment);
         }
-        var tail = json_str.substring(cursor, json_len);
-        that.send_custom_message(final_indicator, tail);
+        //var tail = json_str.substring(cursor, json_len);
+        //that.send_custom_message(final_indicator, tail);
+        that.send_custom_message(final_indicator, true);  // disable command results for now (not used)
     },
 
     to_hex: function(int8) {
