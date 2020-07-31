@@ -115,10 +115,12 @@ import traceback
 from . import js_context
 from .hex_codec import hex_to_bytearray, bytearray_to_hex
 from pprint import pprint
+import numpy as np
+from jupyter_ui_poll import run_ui_poll_loop
 
 # In the IPython context get_ipython is a builtin.
 # get a reference to the IPython notebook object.
-ip = IPython.get_ipython()
+#ip = IPython.get_ipython()   # not used
 
 # For creating unique DOM identities
 IDENTITY_COUNTER = [int(time.time() * 100) % 10000000]
@@ -143,8 +145,17 @@ FRAGILE_JS_REFERENCE = "_FRAGILE_JS_REFERENCE"
 # Reference used for method resolution
 FRAGILE_THIS = "_FRAGILE_THIS"
 
+SEND_FRAGILE_JS_REFERENCE = "_SEND_FRAGILE_JS_REFERENCE"
+
 # Message segmentation size default
 BIG_SEGMENT = 1000000
+
+class SyncTimeOutError(RuntimeError):
+    "The sync operation between the kernel and Javascript timed out."
+
+class JavascriptException(ValueError):
+    "The sync operation caused an exception in the Javascript interpreter."
+
 
 @widgets.register
 class JSProxyWidget(widgets.DOMWidget):
@@ -153,8 +164,8 @@ class JSProxyWidget(widgets.DOMWidget):
     _model_name = Unicode('JSProxyModel').tag(sync=True)
     _view_module = Unicode('jp_proxy_widget').tag(sync=True)
     _model_module = Unicode('jp_proxy_widget').tag(sync=True)
-    _view_module_version = Unicode('^1.0.6').tag(sync=True)
-    _model_module_version = Unicode('^1.0.6').tag(sync=True)
+    _view_module_version = Unicode('^1.0.7').tag(sync=True)
+    _model_module_version = Unicode('^1.0.7').tag(sync=True)
 
     # traitlet port to use for sending commands to javascript
     #commands = traitlets.List([], sync=True)
@@ -204,8 +215,22 @@ class JSProxyWidget(widgets.DOMWidget):
         self.js_init("""
             // make the window accessible through the element
             element.window = window;
+
+            // Initialize caching slots.
             element._FRAGILE_THIS = null;
-        """)
+            element._FRAGILE_JS_REFERENCE = null;
+
+            // The following is used for sending synchronous values.
+            element._SEND_FRAGILE_JS_REFERENCE = function(ms_delay) {
+                // xxxxx add a delay to allow the Python side to be ready for the response (???)
+                ms_delay = ms_delay || 100;
+                var ref = element._FRAGILE_JS_REFERENCE;
+                var delayed = function () {
+                    RECEIVE_FRAGILE_REFERENCE(ref);
+                };
+                setTimeout(delayed, ms_delay);
+            };
+        """, RECEIVE_FRAGILE_REFERENCE=self._RECEIVE_FRAGILE_REFERENCE, callable_level=5)
 
     def set_element(self, slot_name, value):
         """
@@ -268,6 +293,22 @@ class JSProxyWidget(widgets.DOMWidget):
             action()
 
     def wrap_callables(self, x, callable_level=3):
+        def wrapit(x):
+            if callable(x) and not isinstance(x, CommandMakerSuperClass):
+                return self.callable(x, level=callable_level)
+            # otherwise
+            ty = type(x)
+            if ty is list:
+                return list(wrapit(y) for y in x)
+            if ty is tuple:
+                return tuple(wrapit(y) for y in x)
+            if ty is dict:
+                return dict((k, wrapit(v)) for (k,v) in x.items())
+            # default
+            return x
+        return wrapit(x)
+
+    def wrap_callables0(self, x, callable_level=3):
         if callable(x) and not isinstance(x, CommandMakerSuperClass):
             return self.callable(x, level=callable_level)
         w = self.wrap_callables
@@ -286,6 +327,15 @@ class JSProxyWidget(widgets.DOMWidget):
     def setTimeout(self, callable, milliseconds):
         "Convenience access to window.setTimeout in Javascript"
         self.element.window.setTimeout(callable, milliseconds)
+
+    def on_rendered(self, callable, *positional, **keyword):
+        """
+        After the widget has rendered, call the callable using the provided arguments.
+        This can be used to initialize an animation after the widget is visible, for example.
+        """
+        def call_it():
+            return callable(*positional, **keyword)
+        self.js_init("call_it();", call_it=call_it)
 
     def handle_error_msg(self, att_name, old, new):
         if self.print_on_error:
@@ -313,7 +363,7 @@ class JSProxyWidget(widgets.DOMWidget):
         if self.verbose:
             print("sending")
             pprint(package)
-        debug_check_commands(package)
+        #debug_check_commands(package)
         self.send(package)
 
     # slot for last message data debugging
@@ -456,6 +506,31 @@ class JSProxyWidget(widgets.DOMWidget):
             JSProxyWidget._jqueryUI_checked = True
         if onsuccess:
             onsuccess()
+
+    def in_dialog(
+            self,
+            title="",
+            autoOpen=True,
+            buttons=None,  # dict of label to callback
+            height="auto",
+            width=300,
+            modal=False,
+            **other_options,
+        ):
+        """
+        Pop the widget into a floating jQueryUI dialog. See https://api.jqueryui.com/1.9/dialog
+        """
+        self.check_jquery()
+        options = clean_dict(
+            title=title,
+            autoOpen=autoOpen,
+            buttons=buttons,
+            height=height,
+            width=width,
+            modal=modal,
+            **other_options,
+            )
+        self.element.dialog(options)
 
     _require_checked = False
     _needs_requirejs = False
@@ -676,6 +751,68 @@ class JSProxyWidget(widgets.DOMWidget):
             cursor = next_cursor
         json_tail = json_str[cursor:]
         self.send_custom_message(final_ind, json_tail)
+
+    _synced_command_result = None
+    _synced_command_evaluated = False
+    _synced_command_timed_out = False
+    _synced_command_timeout_time = None
+
+    def evaluate(self, command, level=3, timeout=3000, ms_delay=100):
+        "Evaluate the command and return the converted javascript value."
+        # temporarily disable error prints
+        print_on_error = self.print_on_error
+        old_err = self.error_msg
+        try:
+            # Note: if the command buffer has not been flushed other operations may set the error_msg
+            self.print_on_error = False
+            self.error_msg = ""
+            self._synced_command_result = None
+            self._synced_command_timed_out = False
+            self._synced_command_evaluated = False
+            self._synced_command_timeout_time = None
+            start = time.time()
+            if timeout is not None and timeout > 0:
+                self._synced_command_timeout_time = start + timeout
+            start = self._synced_command_start_time = time.time()
+            self._send_synced_command(command, level, ms_delay=ms_delay)
+            run_ui_poll_loop(self._sync_complete)
+            if self._synced_command_timed_out:
+                raise TimeoutError("wait: %s, started: %s; gave up %s" % (timeout, start, time.time()))
+            assert self._synced_command_evaluated, repr((self._synced_command_evaluated, self._synced_command_result))
+            error_msg = self.error_msg
+            result = self._synced_command_result
+            if error_msg:
+                if error_msg == result:
+                    raise JavascriptException("sync error: " + repr(error_msg))
+                else:
+                    old_err = error_msg
+            return result
+        finally:
+            # restore error prints if formerly enabled
+            self.error_msg = old_err
+            self.print_on_error = print_on_error
+
+    def _send_synced_command(self, command, level, ms_delay=100):
+        if self.last_fragile_reference is not command:
+            set_ref = SetMaker(self.get_element(), FRAGILE_JS_REFERENCE, command)
+            self.buffer_command(set_ref)
+        #self.element._SEND_FRAGILE_JS_REFERENCE()
+        get_ref = CallMaker("method", self.get_element(), SEND_FRAGILE_JS_REFERENCE, ms_delay)
+        self.buffer_command(get_ref)
+        self.flush()
+
+    def _RECEIVE_FRAGILE_REFERENCE(self, value):
+        self._synced_command_result = value
+        self._synced_command_evaluated = True
+
+    def _sync_complete(self):
+        if self._synced_command_timeout_time is not None:
+            self._synced_command_timed_out = (time.time() > self._synced_command_timeout_time)
+        test = self._synced_command_evaluated or self._synced_command_timed_out
+        if test:
+            return test
+        else:
+            return None  # only None signals end of polling loop.
     
     """ # doesn't work: not used.
     def evaluate(self, command, level=1, timeout=3000):
@@ -1027,7 +1164,7 @@ class LazyCommandSuperClass(CommandMakerSuperClass):
         #return repr("Javascript disabled for lazy commands: " + repr(type(self)))
 
     def __getattr__(self, attribute):
-        if '_ipython' in attribute:
+        if type(attribute) is str and '_ipython' in attribute:
             return "attributes mentioning _ipython are forbidden because they cause infinite recursions: " + repr(attribute)
         return LazyGet(self.for_widget, self, attribute)
 
@@ -1045,6 +1182,15 @@ class LazyCommandSuperClass(CommandMakerSuperClass):
             f = getattr(self, name)
             return f(*args)
         return result
+
+    def sync_value(self, timeout=3000, level=3, ms_delay=100):
+        """
+        Return the converted javascript-side value for this command.
+        """
+        for_widget = self.for_widget
+        for_widget.evaluate(self, timeout=timeout, level=level, ms_delay=ms_delay)
+        return for_widget._synced_command_result
+
 
 class LazyGet(LazyCommandSuperClass):
 
@@ -1362,7 +1508,6 @@ class InvalidCommand(Exception):
     "Invalid command"
 
 
-
 def debug_check_commands(command):
     "raise an error if the command is not a basic json structure"
     if command is None:
@@ -1379,3 +1524,23 @@ def debug_check_commands(command):
         return debug_check_commands(list(command.items()))
     # otherwise
     raise InvalidCommand(repr(command))
+
+
+
+def clean_dict(**kwargs):
+    "Like dict but with no None values and make some values JSON serializable."
+    # This function is generally useful for passing information to proxy widgets
+    result = {}
+    for kw in kwargs:
+        v = kwargs[kw]
+        if v is not None:
+            if isinstance(v, np.ndarray):
+                # listiffy arrays -- maybe should be done elsewhere
+                v = v.tolist()
+            if isinstance(v, np.floating):
+                v = float(v)
+            if type(v) is tuple:
+                v = list(v)
+            result[kw] = v
+    return result
+

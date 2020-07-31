@@ -448,7 +448,7 @@ class TestProxyWidget(unittest.TestCase):
         assert test.called
         self.assertEqual(results_in, values)"""
 
-    @patch("jp_proxy_widget.proxy_widget.ip")
+    #@patch("jp_proxy_widget.proxy_widget.ip")
     def test_evaluate_commands_timeout(self, *args):
         commands = list(range(100))
         results_in = [33]
@@ -462,9 +462,9 @@ class TestProxyWidget(unittest.TestCase):
         def do_one_iteration():
             callback[0](results_in)
             test()
-        proxy_widget.ip = MagicMock()
-        proxy_widget.ip.kernel = MagicMock()
-        proxy_widget.ip.kernel.do_one_iteration = do_one_iteration
+        #proxy_widget.ip = MagicMock()
+        #proxy_widget.ip.kernel = MagicMock()
+        #proxy_widget.ip.kernel.do_one_iteration = do_one_iteration
         with self.assertRaises(Exception):
             values = widget.evaluate_commands(commands, timeout=-1)
 
@@ -679,6 +679,61 @@ class TestProxyWidget(unittest.TestCase):
         call_attribute = method_call["someOtherAttribute"]
         self.assertIsInstance(call_attribute, proxy_widget.LazyGet)
         self.assertIsInstance(repr(call_attribute), str)  # exercise the repr method
+
+    def test_clean_dict(self, *args):
+        import numpy as np
+        A = np.array([1.1, 2.2], dtype=np.float32)
+        a1 = A[1]
+        assert type(a1) is not float
+        D = proxy_widget.clean_dict(tuple=(1,2,3), array=A, np_float=a1, missing=None)
+        self.assertEqual(D, dict(tuple=[1,2,3], array=A.tolist(), np_float=float(a1)))
+        self.assertEqual(type(D["np_float"]), float)
+
+    @patch("jp_proxy_widget.proxy_widget.run_ui_poll_loop")
+    def test_evaluate_success(self, *args):
+        widget = proxy_widget.JSProxyWidget()
+        def fake_poll(*args):
+            widget._synced_command_evaluated = True
+            widget._synced_command_result = 42
+        proxy_widget.run_ui_poll_loop = fake_poll
+        get_value = widget.element["AnyAttribute"].sync_value(ms_delay=10)
+        self.assertEqual(get_value, 42)
+
+    @patch("jp_proxy_widget.proxy_widget.run_ui_poll_loop")
+    def test_evaluate_exception(self, *args):
+        widget = proxy_widget.JSProxyWidget()
+        def fake_poll(*args):
+            widget._synced_command_evaluated = True
+            widget._synced_command_result = "SOMETHING WENT WRONG"
+            widget.error_msg = "SOMETHING WENT WRONG"
+        proxy_widget.run_ui_poll_loop = fake_poll
+        with self.assertRaises(proxy_widget.JavascriptException):
+            get_value = widget.element["AnyAttribute"].sync_value(ms_delay=10)
+
+    def test_on_rendered(self, *args):
+        widget = proxy_widget.JSProxyWidget()
+        def fake_js_init(js, call_it):
+            call_it()
+        widget.js_init = fake_js_init
+        m = MagicMock()
+        widget.on_rendered(m, "some", "arguments")
+        assert m.called
+
+    def test_in_dialog(self, *args):
+        widget = proxy_widget.JSProxyWidget()
+        m = MagicMock()
+        widget.element.dialog = m
+        widget.in_dialog(
+            title="A Counter",
+            autoOpen=False,
+            buttons=dict(Increment=MagicMock()),
+            height=150,
+            width=600,
+            modal=True,
+            show=dict(effect="blind", duration=1000),
+            hide=dict(effect="fade", duration=1000),
+        )
+        assert m.called
 
 class RequireMockElement:
     "Used for mocking the element when testing loading requirejs"

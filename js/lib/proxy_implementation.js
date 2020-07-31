@@ -26,8 +26,8 @@ var JSProxyModel = widgets.DOMWidgetModel.extend({
         _view_name : 'JSProxyView',
         _model_module : 'jp_proxy_widget',
         _view_module : 'jp_proxy_widget',
-        _model_module_version : '1.0.6',
-        _view_module_version : '1.0.6',
+        _model_module_version : '1.0.7',
+        _view_module_version : '1.0.7',
     })
 });
 
@@ -318,7 +318,9 @@ var JSProxyView = widgets.DOMWidgetView.extend({
                     break;
                 } else {
                     // store result now and proceed
-                    results[i] = that.json_safe(result, level);
+                    //results[i] = that.json_safe(result, level);
+                    // disable return results for now.
+                    results[i] = true;
                 }
             }
             if (evaluator) {
